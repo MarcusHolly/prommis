@@ -2821,10 +2821,19 @@ def optimize_model(m):
 
     # Unfix HCl feed flow rates and concentrations
     for feed in [m.fs.acid_feed1, m.fs.acid_feed2, m.fs.acid_feed3]:
-        # Trying to optimize acid_feed1 will bring its flow to zero
-        # Since optimizing this stream has proved problematic, let's fix to 0.1 L/hr
+        # The flow rate of acid_feed1 is driven to its lower bound during optimization because
+        # impurity removal (Al, Ca, Fe, & Sc) in the scrubbing stage is independent of acid strength (pH), meaning
+        # a stronger acid feed does not remove more impurities. Additionally,
+        # the REEs that we want to keep in this stage are pH-dependent, so having no acid flow ensures that
+        # REEs aren't scrubbed out prematurely. While flow rate does have a marginal
+        # effect on impurity removal via the O:A ratio, it's outweighed by the flow rate penalty and the incentive to
+        # maximize REE recovery in the product. Rather than trying to optimize this flow, we'll just fix it to its
+        # default value (0.1 L/hr) such that the scrubber has a physically realistic acid feed flow.
         if feed == m.fs.acid_feed1:
             continue
+        # The flow rates of acid_feed2 and acid_feed3 are not driven to their lower bounds during optimization because
+        # REE transfer from organic to aqueous is dependent on acid strength. In other words, if these flows were driven
+        # to their lower bounds, the REE product flow would be near-zero since the REEs would be stuck in the organic phase
         else:
             feed.flow_vol.unfix()
         feed.conc_mass_comp[0, "H"].unfix()
