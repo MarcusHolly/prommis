@@ -173,7 +173,7 @@ from idaes.core.initialization import BlockTriangularizationInitializer
 from idaes.core.scaling import ConstraintScalingScheme, CustomScalerBase
 from idaes.core.scaling.util import get_scaling_factor, set_scaling_factor
 from idaes.core.solvers import get_solver
-from idaes.core.util.model_diagnostics import DiagnosticsToolbox
+from idaes.core.util.diagnostics_tools import DiagnosticsToolbox
 from idaes.core.util.model_statistics import degrees_of_freedom
 from idaes.models.properties.modular_properties.base.generic_property import (
     GenericParameterBlock,
@@ -220,11 +220,19 @@ from prommis.solvent_extraction.solvent_extraction_reaction_package import (
 from prommis.uky.costing.costing_dictionaries import load_REE_costing_dictionary
 from prommis.uky.costing.ree_plant_capcost import QGESSCosting, QGESSCostingData
 
+from prommis.properties.mixed_acid_properties import (
+    MixedAcidParameterBlock,
+    MixedAcidPropertiesScaler,
+    _all_components_mw,
+)
+
 _log = idaeslog.getLogger(__name__)
 
 # Epsilon represents near-zero component concentrations
 eps = 1e-8 * units.mg / units.L
 
+# Finally fixed all the DOF issues, but now initialization is failing. Recently added manual initialization for an SX model
+# and will likely need to do the same for more unit models until I can update the tear guesses with an initial solution
 
 def main():
     """
@@ -235,6 +243,10 @@ def main():
     set_operating_conditions(m)
 
     set_scaling(m)
+
+    dt = DiagnosticsToolbox(m)
+    print("Structural Issues")
+    dt.report_structural_issues()
 
     if degrees_of_freedom(m) != 0:
         raise AssertionError(
@@ -284,10 +296,10 @@ def build():
     m.fs = FlowsheetBlock(dynamic=False)
 
     # Leaching property and unit models
-    m.fs.leach_soln = SulfuricAcidLeachingParameters()
+    m.fs.leach_soln = MixedAcidParameterBlock(include_sulfates=True)
     m.fs.coal = CoalRefuseParameters()
     m.fs.leach_rxns = CoalRefuseLeachingReactionParameterBlock()
-    m.fs.HCl_stripping_params = HClStrippingParameterBlock()
+    m.fs.HCl_stripping_params = MixedAcidParameterBlock(include_oxalates=True)
 
     m.fs.leach = LeachingTrain(
         number_of_tanks=2,
@@ -315,6 +327,7 @@ def build():
     m.fs.scrubber_HCl_leach_translator = TranslatorHClLeach(
         inlet_property_package=m.fs.HCl_stripping_params,
         outlet_property_package=m.fs.leach_soln,
+        outlet_state_defined=True,
     )
 
     m.fs.leach_mixer = Mixer(
@@ -501,6 +514,7 @@ def build():
     m.fs.cleaner_HCl_leach_translator = TranslatorHClLeach(
         inlet_property_package=m.fs.HCl_stripping_params,
         outlet_property_package=m.fs.leach_soln,
+        outlet_state_defined=True,
     )
 
     m.fs.leach_sx_mixer = Mixer(
@@ -632,6 +646,10 @@ def build():
         source=m.fs.solex_rougher_scrub.aqueous_outlet,
         destination=m.fs.scrub_sep.inlet,
     )
+    # m.fs.sx_rougher_scrub_aq_outlet = Arc(
+    #     source=m.fs.scrub_sep.recycle,
+    #     destination=m.fs.leach_mixer.scrub_recycle,
+    # )
     m.fs.sx_rougher_scrub_aq_translator = Arc(
         source=m.fs.scrub_sep.recycle,
         destination=m.fs.scrubber_HCl_leach_translator.inlet,
@@ -673,6 +691,10 @@ def build():
         source=m.fs.cleaner_mixer.outlet,
         destination=m.fs.solex_cleaner_load.organic_inlet,
     )
+    # m.fs.sx_cleaner_load_aq_outlet = Arc(
+    #     source=m.fs.solex_cleaner_load.aqueous_outlet,
+    #     destination=m.fs.leach_sx_mixer.cleaner,
+    # )
     m.fs.sx_cleaner_load_aq_outlet_translator = Arc(
         source=m.fs.solex_cleaner_load.aqueous_outlet,
         destination=m.fs.cleaner_HCl_leach_translator.inlet,
@@ -743,16 +765,19 @@ def set_scaling(m):
         m: pyomo model
     """
 
-    liquid_properties_scaler = m.fs.HCl_stripping_params.default_state_scaler_class()
+    leach_properties_scaler = m.fs.leach_soln.default_state_scaler_class()
+    HCl_properties_scaler = m.fs.HCl_stripping_params.default_state_scaler_class()
     vapor_properties_scaler = m.fs.prop_gas.default_state_scaler_class()
 
-    liquid_properties_scaler.default_scaling_factors["flow_vol"] = 1
-    liquid_properties_scaler.default_scaling_factors["conc_mass_comp[H]"] = 1e-3
-    liquid_properties_scaler.default_scaling_factors["conc_mass_comp[Cl]"] = 1e-5
+    leach_properties_scaler.default_scaling_factors["flow_vol"] = 1
+    HCl_properties_scaler.default_scaling_factors["flow_vol"] = 1
+    HCl_properties_scaler.default_scaling_factors["conc_mass_comp[H_+]"] = 1e-3
+    HCl_properties_scaler.default_scaling_factors["conc_mass_comp[Cl_-]"] = 1e-5
     vapor_properties_scaler.default_scaling_factors["flow_mol_phase"] = 1 / 0.00781
 
-    m.fs.HCl_stripping_params.default_state_scaler_object = liquid_properties_scaler
+    m.fs.HCl_stripping_params.default_state_scaler_object = HCl_properties_scaler
     m.fs.prop_gas.default_state_scaler_object = vapor_properties_scaler
+    m.fs.leach_soln.default_state_scaler_object = leach_properties_scaler
 
     # Also use global mutation to change the max and min scaling factors
     # allowed from objects derived from CustomScalerBase, i.e., all the
@@ -806,9 +831,9 @@ def set_operating_conditions(m, DEHPA_dosage=0.2):
     m.fs.leach_liquid_feed.flow_vol.fix(100 * units.L / units.hour)
     m.fs.leach_liquid_feed.conc_mass_comp.fix(1e-10 * units.mg / units.L)
     m.fs.leach_liquid_feed.conc_mass_comp[0, "H2O"].fix(1e6 * units.mg / units.L)
-    m.fs.leach_liquid_feed.conc_mass_comp[0, "H"].fix(277 * units.mg / units.L)
-    m.fs.leach_liquid_feed.conc_mass_comp[0, "HSO4"].fix(25025 * units.mg / units.L)
-    m.fs.leach_liquid_feed.conc_mass_comp[0, "SO4"].fix(915 * units.mg / units.L)
+    m.fs.leach_liquid_feed.conc_mass_comp[0, "H_+"].fix(277 * units.mg / units.L)
+    m.fs.leach_liquid_feed.conc_mass_comp[0, "HSO4_-"].fix(25025 * units.mg / units.L)
+    m.fs.leach_liquid_feed.conc_mass_comp[0, "SO4_2-"].fix(915 * units.mg / units.L)
 
     m.fs.leach_solid_feed.flow_mass.fix(22.68 * units.kg / units.hour)
     m.fs.leach_solid_feed.mass_frac_comp[0, "inerts"].fix(0.6952 * units.kg / units.kg)
@@ -846,11 +871,14 @@ def set_operating_conditions(m, DEHPA_dosage=0.2):
     m.fs.leach.volume.fix(100 * units.gallon)
 
     # Fix all temperatures and pressure
-    m.fs.scrubber_HCl_leach_translator.outlet.temperature.fix(Temp_room)
-    m.fs.scrubber_HCl_leach_translator.outlet.pressure.fix(P_atm)
+    m.fs.acid_feed1.properties[0].temperature.fix(Temp_room)
+    m.fs.acid_feed1.properties[0].pressure.fix(P_atm)
 
-    m.fs.cleaner_HCl_leach_translator.outlet.temperature.fix(Temp_room)
-    m.fs.cleaner_HCl_leach_translator.outlet.pressure.fix(P_atm)
+    m.fs.acid_feed2.properties[0].temperature.fix(Temp_room)
+    m.fs.acid_feed2.properties[0].pressure.fix(P_atm)
+
+    m.fs.acid_feed3.properties[0].temperature.fix(Temp_room)
+    m.fs.acid_feed3.properties[0].pressure.fix(P_atm)
 
     m.fs.solex_rougher_load.mscontactor.aqueous[:, :].temperature.fix(Temp_room)
     m.fs.solex_rougher_load.mscontactor.aqueous[:, :].pressure.fix(P_atm)
@@ -859,15 +887,39 @@ def set_operating_conditions(m, DEHPA_dosage=0.2):
 
     m.fs.solex_rougher_scrub.mscontactor.organic[:, :].temperature.fix(Temp_room)
     m.fs.solex_rougher_scrub.mscontactor.organic[:, :].pressure.fix(P_atm)
+    m.fs.solex_rougher_scrub.mscontactor.aqueous[:, :].temperature.fix(Temp_room)
+    m.fs.solex_rougher_scrub.mscontactor.aqueous[:, :].pressure.fix(P_atm)
 
     m.fs.solex_rougher_strip.mscontactor.organic[:, :].temperature.fix(Temp_room)
     m.fs.solex_rougher_strip.mscontactor.organic[:, :].pressure.fix(P_atm)
+    m.fs.solex_rougher_strip.mscontactor.aqueous[:, :].temperature.fix(Temp_room)
+    m.fs.solex_rougher_strip.mscontactor.aqueous[:, :].pressure.fix(P_atm)
 
     m.fs.solex_cleaner_load.mscontactor.organic[:, :].temperature.fix(Temp_room)
     m.fs.solex_cleaner_load.mscontactor.organic[:, :].pressure.fix(P_atm)
+    m.fs.solex_cleaner_load.mscontactor.aqueous[:, :].temperature.fix(Temp_room)
+    m.fs.solex_cleaner_load.mscontactor.aqueous[:, :].pressure.fix(P_atm)
 
     m.fs.solex_cleaner_strip.mscontactor.organic[:, :].temperature.fix(Temp_room)
     m.fs.solex_cleaner_strip.mscontactor.organic[:, :].pressure.fix(P_atm)
+    m.fs.solex_cleaner_strip.mscontactor.aqueous[:, :].temperature.fix(Temp_room)
+    m.fs.solex_cleaner_strip.mscontactor.aqueous[:, :].pressure.fix(P_atm)
+
+    m.fs.precip_sep.mixed_state[0].temperature.fix(Temp_room)
+    m.fs.precip_sep.mixed_state[0].pressure.fix(P_atm)
+    m.fs.precip_sep.purge_state[0].temperature.fix(Temp_room)
+    m.fs.precip_sep.purge_state[0].pressure.fix(P_atm)
+
+    m.fs.precip_sx_mixer.mixed_state[0].temperature.fix(Temp_room)
+    m.fs.precip_sx_mixer.mixed_state[0].pressure.fix(P_atm)
+    m.fs.precip_sx_mixer.precip_state[0].temperature.fix(Temp_room)
+    m.fs.precip_sx_mixer.precip_state[0].pressure.fix(P_atm)
+
+    m.fs.precipitator.cv_aqueous.properties_out[0].temperature.fix(Temp_room)
+    m.fs.precipitator.cv_aqueous.properties_out[0].pressure.fix(P_atm)
+
+    m.fs.roaster.liquid_in[0].temperature.fix(Temp_room)
+    m.fs.roaster.liquid_in[0].pressure.fix(P_atm)
 
     m.fs.cleaner_sep.recycle_state[0.0].temperature.fix(Temp_room)
     m.fs.cleaner_sep.recycle_state[0.0].pressure.fix(P_atm)
@@ -881,6 +933,8 @@ def set_operating_conditions(m, DEHPA_dosage=0.2):
     m.fs.leach_mixer.mixed_state[0.0].temperature.fix(Temp_room)
     m.fs.load_sep.recycle_state[0.0].pressure.fix(P_atm)
     m.fs.load_sep.recycle_state[0.0].temperature.fix(Temp_room)
+    m.fs.scrub_sep.recycle_state[0.0].pressure.fix(P_atm)
+    m.fs.scrub_sep.recycle_state[0.0].temperature.fix(Temp_room)
     m.fs.leach_sx_mixer.mixed_state[0.0].pressure.fix(P_atm)
     m.fs.leach_sx_mixer.mixed_state[0.0].temperature.fix(Temp_room)
 
@@ -892,56 +946,24 @@ def set_operating_conditions(m, DEHPA_dosage=0.2):
     m.fs.rougher_org_make_up.properties[0.0].temperature.fix(Temp_room)
     m.fs.rougher_mixer.mixed_state[0.0].pressure.fix(P_atm)
     m.fs.rougher_mixer.mixed_state[0.0].temperature.fix(Temp_room)
-    m.fs.rougher_org_make_up.conc_mass_comp[0, "Al_o"].fix(eps)
-    m.fs.rougher_org_make_up.conc_mass_comp[0, "Ca_o"].fix(eps)
-    m.fs.rougher_org_make_up.conc_mass_comp[0, "Fe_o"].fix(eps)
-    m.fs.rougher_org_make_up.conc_mass_comp[0, "Sc_o"].fix(eps)
-    m.fs.rougher_org_make_up.conc_mass_comp[0, "Y_o"].fix(eps)
-    m.fs.rougher_org_make_up.conc_mass_comp[0, "La_o"].fix(eps)
-    m.fs.rougher_org_make_up.conc_mass_comp[0, "Ce_o"].fix(eps)
-    m.fs.rougher_org_make_up.conc_mass_comp[0, "Pr_o"].fix(eps)
-    m.fs.rougher_org_make_up.conc_mass_comp[0, "Nd_o"].fix(eps)
-    m.fs.rougher_org_make_up.conc_mass_comp[0, "Sm_o"].fix(eps)
-    m.fs.rougher_org_make_up.conc_mass_comp[0, "Gd_o"].fix(eps)
-    m.fs.rougher_org_make_up.conc_mass_comp[0, "Dy_o"].fix(eps)
+
+    m.fs.rougher_org_make_up.conc_mass_comp.fix(eps)
     m.fs.rougher_org_make_up.conc_mass_comp[0, "DEHPA"].fix(dehpa_conc)
     m.fs.rougher_org_make_up.conc_mass_comp[0, "Kerosene"].fix(kerosene_conc)
 
     # 0.974M HCl; pH = 0.01
     m.fs.acid_feed1.flow_vol.fix(0.1 * units.L / units.hr)
+    m.fs.acid_feed1.conc_mass_comp.fix(eps)
     m.fs.acid_feed1.conc_mass_comp[0, "H2O"].fix(1000000)
-    m.fs.acid_feed1.conc_mass_comp[0, "H"].fix(981.44 * units.mg / units.L)
-    m.fs.acid_feed1.conc_mass_comp[0, "Cl"].fix(34518.74 * units.mg / units.L)
-    m.fs.acid_feed1.conc_mass_comp[0, "Al"].fix(eps)
-    m.fs.acid_feed1.conc_mass_comp[0, "Ca"].fix(eps)
-    m.fs.acid_feed1.conc_mass_comp[0, "Fe"].fix(eps)
-    m.fs.acid_feed1.conc_mass_comp[0, "Sc"].fix(eps)
-    m.fs.acid_feed1.conc_mass_comp[0, "Y"].fix(eps)
-    m.fs.acid_feed1.conc_mass_comp[0, "La"].fix(eps)
-    m.fs.acid_feed1.conc_mass_comp[0, "Ce"].fix(eps)
-    m.fs.acid_feed1.conc_mass_comp[0, "Pr"].fix(eps)
-    m.fs.acid_feed1.conc_mass_comp[0, "Nd"].fix(eps)
-    m.fs.acid_feed1.conc_mass_comp[0, "Sm"].fix(eps)
-    m.fs.acid_feed1.conc_mass_comp[0, "Gd"].fix(eps)
-    m.fs.acid_feed1.conc_mass_comp[0, "Dy"].fix(eps)
+    m.fs.acid_feed1.conc_mass_comp[0, "H_+"].fix(981.44 * units.mg / units.L)
+    m.fs.acid_feed1.conc_mass_comp[0, "Cl_-"].fix(34518.74 * units.mg / units.L)
 
     # 1M HCl; pH = 0
     m.fs.acid_feed2.flow_vol.fix(3.375 * units.L / units.hr)
+    m.fs.acid_feed2.conc_mass_comp.fix(eps)
     m.fs.acid_feed2.conc_mass_comp[0, "H2O"].fix(1000000)
-    m.fs.acid_feed2.conc_mass_comp[0, "H"].fix(1008 * units.mg / units.L)
-    m.fs.acid_feed2.conc_mass_comp[0, "Cl"].fix(35453 * units.mg / units.L)
-    m.fs.acid_feed2.conc_mass_comp[0, "Al"].fix(eps)
-    m.fs.acid_feed2.conc_mass_comp[0, "Ca"].fix(eps)
-    m.fs.acid_feed2.conc_mass_comp[0, "Fe"].fix(eps)
-    m.fs.acid_feed2.conc_mass_comp[0, "Sc"].fix(eps)
-    m.fs.acid_feed2.conc_mass_comp[0, "Y"].fix(eps)
-    m.fs.acid_feed2.conc_mass_comp[0, "La"].fix(eps)
-    m.fs.acid_feed2.conc_mass_comp[0, "Ce"].fix(eps)
-    m.fs.acid_feed2.conc_mass_comp[0, "Pr"].fix(eps)
-    m.fs.acid_feed2.conc_mass_comp[0, "Nd"].fix(eps)
-    m.fs.acid_feed2.conc_mass_comp[0, "Sm"].fix(eps)
-    m.fs.acid_feed2.conc_mass_comp[0, "Gd"].fix(eps)
-    m.fs.acid_feed2.conc_mass_comp[0, "Dy"].fix(eps)
+    m.fs.acid_feed2.conc_mass_comp[0, "H_+"].fix(1008 * units.mg / units.L)
+    m.fs.acid_feed2.conc_mass_comp[0, "Cl_-"].fix(35453 * units.mg / units.L)
 
     m.fs.rougher_sep.split_fraction[:, "recycle"].fix(0.9)
     m.fs.rougher_sep.purge_state[0.0].pressure.fix(P_atm)
@@ -951,35 +973,13 @@ def set_operating_conditions(m, DEHPA_dosage=0.2):
 
     # 1M HCl; pH = 0
     m.fs.acid_feed3.flow_vol.fix(3.517 * units.L / units.hr)
+    m.fs.acid_feed3.conc_mass_comp.fix(eps)
     m.fs.acid_feed3.conc_mass_comp[0, "H2O"].fix(1000000)
-    m.fs.acid_feed3.conc_mass_comp[0, "H"].fix(1008 * units.mg / units.L)
-    m.fs.acid_feed3.conc_mass_comp[0, "Cl"].fix(35453 * units.mg / units.L)
-    m.fs.acid_feed3.conc_mass_comp[0, "Al"].fix(eps)
-    m.fs.acid_feed3.conc_mass_comp[0, "Ca"].fix(eps)
-    m.fs.acid_feed3.conc_mass_comp[0, "Fe"].fix(eps)
-    m.fs.acid_feed3.conc_mass_comp[0, "Sc"].fix(eps)
-    m.fs.acid_feed3.conc_mass_comp[0, "Y"].fix(eps)
-    m.fs.acid_feed3.conc_mass_comp[0, "La"].fix(eps)
-    m.fs.acid_feed3.conc_mass_comp[0, "Ce"].fix(eps)
-    m.fs.acid_feed3.conc_mass_comp[0, "Pr"].fix(eps)
-    m.fs.acid_feed3.conc_mass_comp[0, "Nd"].fix(eps)
-    m.fs.acid_feed3.conc_mass_comp[0, "Sm"].fix(eps)
-    m.fs.acid_feed3.conc_mass_comp[0, "Gd"].fix(eps)
-    m.fs.acid_feed3.conc_mass_comp[0, "Dy"].fix(eps)
+    m.fs.acid_feed3.conc_mass_comp[0, "H_+"].fix(1008 * units.mg / units.L)
+    m.fs.acid_feed3.conc_mass_comp[0, "Cl_-"].fix(35453 * units.mg / units.L)
 
     m.fs.cleaner_org_make_up.flow_vol.fix(60.33)
-    m.fs.cleaner_org_make_up.conc_mass_comp[0, "Al_o"].fix(eps)
-    m.fs.cleaner_org_make_up.conc_mass_comp[0, "Ca_o"].fix(eps)
-    m.fs.cleaner_org_make_up.conc_mass_comp[0, "Fe_o"].fix(eps)
-    m.fs.cleaner_org_make_up.conc_mass_comp[0, "Sc_o"].fix(eps)
-    m.fs.cleaner_org_make_up.conc_mass_comp[0, "Y_o"].fix(eps)
-    m.fs.cleaner_org_make_up.conc_mass_comp[0, "La_o"].fix(eps)
-    m.fs.cleaner_org_make_up.conc_mass_comp[0, "Ce_o"].fix(eps)
-    m.fs.cleaner_org_make_up.conc_mass_comp[0, "Pr_o"].fix(eps)
-    m.fs.cleaner_org_make_up.conc_mass_comp[0, "Nd_o"].fix(eps)
-    m.fs.cleaner_org_make_up.conc_mass_comp[0, "Sm_o"].fix(eps)
-    m.fs.cleaner_org_make_up.conc_mass_comp[0, "Gd_o"].fix(eps)
-    m.fs.cleaner_org_make_up.conc_mass_comp[0, "Dy_o"].fix(eps)
+    m.fs.cleaner_org_make_up.conc_mass_comp.fix(eps)
     m.fs.cleaner_org_make_up.conc_mass_comp[0, "DEHPA"].fix(dehpa_conc)
     m.fs.cleaner_org_make_up.conc_mass_comp[0, "Kerosene"].fix(kerosene_conc)
     m.fs.cleaner_org_make_up.properties[0.0].pressure.fix(P_atm)
@@ -1079,23 +1079,23 @@ def initialize_system(m):
     tear_guesses1 = {
         "flow_vol": {0: 288.18},
         "conc_mass_comp": {
-            (0, "Al"): 1759.30,
-            (0, "Ca"): 228.06,
-            (0, "Ce"): 1.36,
-            (0, "Cl"): 2097.49,
-            (0, "Dy"): 7.63e-3,
-            (0, "Fe"): 2089.62,
-            (0, "Gd"): 0.064,
-            (0, "H"): 40.89,
+            (0, "Al_3+"): 1759.30,
+            (0, "Ca_2+"): 228.06,
+            (0, "Ce_3+"): 1.36,
+            (0, "Cl_-"): 2097.49,
+            (0, "Dy_3+"): 7.63e-3,
+            (0, "Fe_3+"): 2089.62,
+            (0, "Gd_3+"): 0.064,
+            (0, "H_+"): 40.89,
             (0, "H2O"): 1000000,
-            (0, "HSO4"): 19465.77,
-            (0, "La"): 4.29,
-            (0, "Nd"): 1.63,
-            (0, "Pr"): 1.37,
-            (0, "SO4"): 4820.67,
-            (0, "Sc"): 2.5e-3,
-            (0, "Sm"): 0.69,
-            (0, "Y"): 3.06e-3,
+            (0, "HSO4_-"): 19465.77,
+            (0, "La_3+"): 4.29,
+            (0, "Nd_3+"): 1.63,
+            (0, "Pr_3+"): 1.37,
+            (0, "SO4_2-"): 4820.67,
+            (0, "Sc_3+"): 2.5e-3,
+            (0, "Sm_3+"): 0.69,
+            (0, "Y_3+"): 3.06e-3,
         },
     }
     tear_guesses2 = {
@@ -1120,23 +1120,23 @@ def initialize_system(m):
     tear_guesses3 = {
         "flow_vol": {0: 208.99},
         "conc_mass_comp": {
-            (0, "Al"): 2738.65,
-            (0, "Ca"): 355.51,
-            (0, "Ce"): 17.72,
-            (0, "Cl"): 3197.12,
-            (0, "Dy"): 0.50,
-            (0, "Fe"): 3278.86,
-            (0, "Gd"): 1.47,
-            (0, "H"): 4.26,
+            (0, "Al_3+"): 2738.65,
+            (0, "Ca_2+"): 355.51,
+            (0, "Ce_3+"): 17.72,
+            (0, "Cl_-"): 3197.12,
+            (0, "Dy_3+"): 0.50,
+            (0, "Fe_3+"): 3278.86,
+            (0, "Gd_3+"): 1.47,
+            (0, "H_+"): 4.26,
             (0, "H2O"): 1000000,
-            (0, "HSO4"): 6900.7,
-            (0, "La"): 7.38,
-            (0, "Nd"): 7.99,
-            (0, "Pr"): 2.23,
-            (0, "SO4"): 16419.12,
-            (0, "Sc"): 0.17,
-            (0, "Sm"): 1.12,
-            (0, "Y"): 0.80,
+            (0, "HSO4_-"): 6900.7,
+            (0, "La_3+"): 7.38,
+            (0, "Nd_3+"): 7.99,
+            (0, "Pr_3+"): 2.23,
+            (0, "SO4_2-"): 16419.12,
+            (0, "Sc_3+"): 0.17,
+            (0, "Sm_3+"): 1.12,
+            (0, "Y_3+"): 0.80,
         },
     }
     tear_guesses4 = {
@@ -1161,21 +1161,24 @@ def initialize_system(m):
     tear_guesses5 = {
         "flow_vol": {0: 6.91},
         "conc_mass_comp": {
-            (0, "Al"): 1588.08,
-            (0, "Ca"): 197.47,
-            (0, "Ce"): 525.13,
-            (0, "Cl"): 35453.0,
-            (0, "Dy"): 15.14,
-            (0, "Fe"): 1932.16,
-            (0, "Gd"): 42.49,
-            (0, "H"): 692.2,
+            (0, "Al_3+"): 1588.08,
+            (0, "Ca_2+"): 197.47,
+            (0, "Ce_3+"): 525.13,
+            (0, "Cl_-"): 35453.0,
+            (0, "Dy_3+"): 15.14,
+            (0, "Fe_3+"): 1932.16,
+            (0, "Gd_3+"): 42.49,
+            (0, "H_+"): 692.2,
             (0, "H2O"): 1000000,
-            (0, "La"): 29.36,
-            (0, "Nd"): 175.35,
-            (0, "Pr"): 3.77,
-            (0, "Sc"): 2.13e-3,
-            (0, "Sm"): 1.87,
-            (0, "Y"): 14.079,
+            (0, "La_3+"): 29.36,
+            (0, "Nd_3+"): 175.35,
+            (0, "Pr_3+"): 3.77,
+            (0, "Sc_3+"): 2.13e-3,
+            (0, "Sm_3+"): 1.87,
+            (0, "Y_3+"): 14.079,
+            (0, "H2C2O4"): 1e-3,
+            (0, "HC2O4_-"): 1e-3,
+            (0, "C2O4_2-"): 1e-3,
         },
     }
 
@@ -1219,15 +1222,15 @@ def initialize_system(m):
 
     initializer_leach = LeachingTrainInitializer()
     leach_units = [
-        m.fs.leach,
+        # m.fs.leach,
     ]
 
     initializer_sx = SolventExtractionInitializer()
     sx_units = [
         m.fs.solex_rougher_load,
-        m.fs.solex_rougher_scrub,
+        # m.fs.solex_rougher_scrub,
         m.fs.solex_rougher_strip,
-        m.fs.solex_cleaner_load,
+        # m.fs.solex_cleaner_load,
         m.fs.solex_cleaner_strip,
     ]
 
@@ -1237,6 +1240,157 @@ def initialize_system(m):
         if unit in feed_units:
             _log.info(f"Initializing {unit}")
             initializer_feed.initialize(unit)
+        elif unit == m.fs.leach:
+            _log.info(f"Manually initializing {unit}")
+            m.fs.leach.liquid_inlet.flow_vol.fix()
+            m.fs.leach.liquid_inlet.conc_mass_comp.fix()
+            m.fs.leach.liquid_inlet.temperature.fix()
+            m.fs.leach.liquid_inlet.pressure.fix()
+
+            m.fs.leach.solid_inlet.flow_mass.fix()
+            m.fs.leach.solid_inlet.mass_frac_comp.fix()
+
+            solver = get_solver()
+            solver.solve(m.fs.leach, tee=True)
+
+            m.fs.leach.liquid_inlet.flow_vol.unfix()
+            m.fs.leach.liquid_inlet.conc_mass_comp.unfix()
+            m.fs.leach.liquid_inlet.temperature.unfix()
+            m.fs.leach.liquid_inlet.pressure.unfix()
+
+            m.fs.leach.solid_inlet.flow_mass.unfix()
+            m.fs.leach.solid_inlet.mass_frac_comp.unfix()
+
+        elif unit == m.fs.solex_cleaner_load:
+            _log.info(f"Manually initializing {unit}")
+            m.fs.solex_cleaner_load.aqueous_inlet.flow_vol.fix()
+            m.fs.solex_cleaner_load.aqueous_inlet.conc_mass_comp.fix()
+            m.fs.solex_cleaner_load.aqueous_inlet.temperature.fix()
+            m.fs.solex_cleaner_load.aqueous_inlet.pressure.fix()
+
+            m.fs.solex_cleaner_load.organic_inlet.flow_vol.fix()
+            m.fs.solex_cleaner_load.organic_inlet.conc_mass_comp.fix()
+            m.fs.solex_cleaner_load.organic_inlet.temperature.fix()
+            m.fs.solex_cleaner_load.organic_inlet.pressure.fix()
+
+            solver = get_solver()
+            solver.solve(m.fs.solex_cleaner_load, tee=True)
+
+            m.fs.solex_cleaner_load.aqueous_inlet.flow_vol.unfix()
+            m.fs.solex_cleaner_load.aqueous_inlet.conc_mass_comp.unfix()
+            m.fs.solex_cleaner_load.aqueous_inlet.temperature.unfix()
+            m.fs.solex_cleaner_load.aqueous_inlet.pressure.unfix()
+
+            m.fs.solex_cleaner_load.organic_inlet.flow_vol.unfix()
+            m.fs.solex_cleaner_load.organic_inlet.conc_mass_comp.unfix()
+            m.fs.solex_cleaner_load.organic_inlet.temperature.unfix()
+            m.fs.solex_cleaner_load.organic_inlet.pressure.unfix()
+
+        elif unit == m.fs.solex_rougher_scrub:
+            _log.info(f"Manually initializing {unit}")
+            m.fs.solex_rougher_scrub.aqueous_inlet.flow_vol.fix()
+            m.fs.solex_rougher_scrub.aqueous_inlet.conc_mass_comp.fix()
+            m.fs.solex_rougher_scrub.aqueous_inlet.temperature.fix()
+            m.fs.solex_rougher_scrub.aqueous_inlet.pressure.fix()
+
+            m.fs.solex_rougher_scrub.organic_inlet.flow_vol.fix()
+            m.fs.solex_rougher_scrub.organic_inlet.conc_mass_comp.fix()
+            m.fs.solex_rougher_scrub.organic_inlet.temperature.fix()
+            m.fs.solex_rougher_scrub.organic_inlet.pressure.fix()
+
+            solver = get_solver()
+            solver.solve(m.fs.solex_rougher_scrub, tee=True)
+
+            m.fs.solex_rougher_scrub.aqueous_inlet.flow_vol.unfix()
+            m.fs.solex_rougher_scrub.aqueous_inlet.conc_mass_comp.unfix()
+            m.fs.solex_rougher_scrub.aqueous_inlet.temperature.unfix()
+            m.fs.solex_rougher_scrub.aqueous_inlet.pressure.unfix()
+
+            m.fs.solex_rougher_scrub.organic_inlet.flow_vol.unfix()
+            m.fs.solex_rougher_scrub.organic_inlet.conc_mass_comp.unfix()
+            m.fs.solex_rougher_scrub.organic_inlet.temperature.unfix()
+            m.fs.solex_rougher_scrub.organic_inlet.pressure.unfix()
+
+        elif unit == m.fs.solex_rougher_strip:
+            _log.info(f"Manually initializing {unit}")
+            m.fs.solex_rougher_strip.aqueous_inlet.flow_vol.fix()
+            m.fs.solex_rougher_strip.aqueous_inlet.conc_mass_comp.fix()
+            m.fs.solex_rougher_strip.aqueous_inlet.temperature.fix()
+            m.fs.solex_rougher_strip.aqueous_inlet.pressure.fix()
+
+            m.fs.solex_rougher_strip.organic_inlet.flow_vol.fix()
+            m.fs.solex_rougher_strip.organic_inlet.conc_mass_comp.fix()
+            m.fs.solex_rougher_strip.organic_inlet.temperature.fix()
+            m.fs.solex_rougher_strip.organic_inlet.pressure.fix()
+
+            solver = get_solver()
+            solver.solve(m.fs.solex_rougher_strip, tee=True)
+
+            m.fs.solex_rougher_strip.aqueous_inlet.flow_vol.unfix()
+            m.fs.solex_rougher_strip.aqueous_inlet.conc_mass_comp.unfix()
+            m.fs.solex_rougher_strip.aqueous_inlet.temperature.unfix()
+            m.fs.solex_rougher_strip.aqueous_inlet.pressure.unfix()
+
+            m.fs.solex_rougher_strip.organic_inlet.flow_vol.unfix()
+            m.fs.solex_rougher_strip.organic_inlet.conc_mass_comp.unfix()
+            m.fs.solex_rougher_strip.organic_inlet.temperature.unfix()
+            m.fs.solex_rougher_strip.organic_inlet.pressure.unfix()
+
+        elif unit == m.fs.solex_cleaner_strip:
+            _log.info(f"Manually initializing {unit}")
+            m.fs.solex_cleaner_strip.aqueous_inlet.flow_vol.fix()
+            m.fs.solex_cleaner_strip.aqueous_inlet.conc_mass_comp.fix()
+            m.fs.solex_cleaner_strip.aqueous_inlet.temperature.fix()
+            m.fs.solex_cleaner_strip.aqueous_inlet.pressure.fix()
+
+            m.fs.solex_cleaner_strip.organic_inlet.flow_vol.fix()
+            m.fs.solex_cleaner_strip.organic_inlet.conc_mass_comp.fix()
+            m.fs.solex_cleaner_strip.organic_inlet.temperature.fix()
+            m.fs.solex_cleaner_strip.organic_inlet.pressure.fix()
+
+            solver = get_solver()
+            solver.solve(m.fs.solex_cleaner_strip, tee=True)
+
+            m.fs.solex_cleaner_strip.aqueous_inlet.flow_vol.unfix()
+            m.fs.solex_cleaner_strip.aqueous_inlet.conc_mass_comp.unfix()
+            m.fs.solex_cleaner_strip.aqueous_inlet.temperature.unfix()
+            m.fs.solex_cleaner_strip.aqueous_inlet.pressure.unfix()
+
+            m.fs.solex_cleaner_strip.organic_inlet.flow_vol.unfix()
+            m.fs.solex_cleaner_strip.organic_inlet.conc_mass_comp.unfix()
+            m.fs.solex_cleaner_strip.organic_inlet.temperature.unfix()
+            m.fs.solex_cleaner_strip.organic_inlet.pressure.unfix()
+        #
+        # elif unit == m.fs.cleaner_HCl_leach_translator:
+        #     _log.info(f"Manually initializing {unit}")
+        #     m.fs.cleaner_HCl_leach_translator.inlet.flow_vol.fix()
+        #     m.fs.cleaner_HCl_leach_translator.inlet.conc_mass_comp.fix()
+        #     m.fs.cleaner_HCl_leach_translator.inlet.temperature.fix()
+        #     m.fs.cleaner_HCl_leach_translator.inlet.pressure.fix()
+        #
+        #     solver = get_solver()
+        #     solver.solve(m.fs.cleaner_HCl_leach_translator, tee=True)
+        #
+        #     m.fs.cleaner_HCl_leach_translator.inlet.flow_vol.unfix()
+        #     m.fs.cleaner_HCl_leach_translator.inlet.conc_mass_comp.unfix()
+        #     m.fs.cleaner_HCl_leach_translator.inlet.temperature.unfix()
+        #     m.fs.cleaner_HCl_leach_translator.inlet.pressure.unfix()
+        #
+        # elif unit == m.fs.precipitator:
+        #     _log.info(f"Manually initializing {unit}")
+        #     m.fs.precipitator.aqueous_inlet.flow_vol.fix()
+        #     m.fs.precipitator.aqueous_inlet.conc_mass_comp.fix()
+        #     m.fs.precipitator.aqueous_inlet.temperature.fix()
+        #     m.fs.precipitator.aqueous_inlet.pressure.fix()
+        #
+        #     solver = get_solver()
+        #     solver.solve(m.fs.precipitator, tee=True)
+        #
+        #     m.fs.precipitator.aqueous_inlet.flow_vol.unfix()
+        #     m.fs.precipitator.aqueous_inlet.conc_mass_comp.unfix()
+        #     m.fs.precipitator.aqueous_inlet.temperature.unfix()
+        #     m.fs.precipitator.aqueous_inlet.pressure.unfix()
+
         elif unit in product_units:
             _log.info(f"Initializing {unit}")
             initializer_product.initialize(unit)
@@ -2773,16 +2927,16 @@ def optimize_model(m):
     # Unfix the H2SO4 feed rate and feed concentration
     m.fs.leach_liquid_feed.flow_vol.unfix()
 
-    m.fs.leach_liquid_feed.conc_mass_comp[0, "H"].unfix()
-    m.fs.leach_liquid_feed.conc_mass_comp[0, "HSO4"].unfix()
-    m.fs.leach_liquid_feed.conc_mass_comp[0, "SO4"].unfix()
+    m.fs.leach_liquid_feed.conc_mass_comp[0, "H_+"].unfix()
+    m.fs.leach_liquid_feed.conc_mass_comp[0, "HSO4_-"].unfix()
+    m.fs.leach_liquid_feed.conc_mass_comp[0, "SO4_2-"].unfix()
 
     @m.fs.leach_liquid_feed.Constraint(m.fs.time)
     def H2SO4_stoich_eqn(b, t):
         return (
-            b.properties[t].conc_mol_comp["H"]
-            == 2 * b.properties[t].conc_mol_comp["SO4"]
-            + b.properties[t].conc_mol_comp["HSO4"]
+            b.properties[t].conc_mol_comp["H_+"]
+            == 2 * b.properties[t].conc_mol_comp["SO4_2-"]
+            + b.properties[t].conc_mol_comp["HSO4_-"]
         )
 
     for condata in m.fs.leach_liquid_feed.H2SO4_stoich_eqn.values():
@@ -2795,8 +2949,8 @@ def optimize_model(m):
     @m.fs.leach_liquid_feed.Constraint(m.fs.time)
     def HSO4_dissociation(b, t):
         return (
-            b.properties[t].params.Ka2 * b.properties[t].conc_mol_comp["HSO4"]
-            == b.properties[t].conc_mol_comp["SO4"] * b.properties[t].conc_mol_comp["H"]
+            b.params.k_eq["H2SO4_Ka2"] * b.properties[t].conc_mol_comp["HSO4_-"]
+            == b.properties[t].conc_mol_comp["SO4_2-"] * b.properties[t].conc_mol_comp["H_+"]
         )
 
     sf = get_scaling_factor(m.fs.leach.mscontactor.liquid[0, 1].hso4_dissociation)
@@ -2836,16 +2990,16 @@ def optimize_model(m):
         # to their lower bounds, the REE product flow would be near-zero since the REEs would be stuck in the organic phase
         else:
             feed.flow_vol.unfix()
-        feed.conc_mass_comp[0, "H"].unfix()
-        feed.conc_mass_comp[0, "Cl"].unfix()
+        feed.conc_mass_comp[0, "H_+"].unfix()
+        feed.conc_mass_comp[0, "Cl_-"].unfix()
         # Revisit how strong of an acid we can use
         feed.properties[0].pH_phase["liquid"].setlb(0)
 
         @feed.Constraint(m.fs.time)
         def HCl_stoich_eqn(b, t):
             return (
-                b.properties[t].conc_mol_comp["H"]
-                == b.properties[t].conc_mol_comp["Cl"]
+                b.properties[t].conc_mol_comp["H_+"]
+                == b.properties[t].conc_mol_comp["Cl_-"]
             )
 
         for condata in feed.HCl_stoich_eqn.values():
