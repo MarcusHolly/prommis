@@ -102,11 +102,6 @@ class TranslatorHClLeachScaler(CustomScalerBase):
                 self.scale_constraint_by_nominal_value(
                     condata, scheme=ConstraintScalingScheme.inverseMaximum, overwrite=overwrite,
                 )
-        # if hasattr(model, "conc_mass_oxalates_eqn"):
-        #     for condata in model.conc_mass_oxalates_eqn.values():
-        #         self.scale_constraint_by_nominal_value(
-        #             condata, scheme=ConstraintScalingScheme.inverseMaximum, overwrite=overwrite,
-        #         )
 
 
 @declare_process_block_class("TranslatorHClLeach")
