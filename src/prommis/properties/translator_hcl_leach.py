@@ -203,10 +203,6 @@ class TranslatorHClLeachData(TranslatorData):
             self.flowsheet().time,
             doc="Defines mass concentration for the sulfate components",
         )
-        # TODO: This is whats causing the DOF issue in initialization. Use claude to figure out how to handle this
-        # If I make the suggested change, there are -2 DOF on the flowsheet
-        # The issue lies in how the translator handles sulfates and the defined_state config
-        # inappropriately the constraints for the sulfates
         def conc_mass_comp_sulfate_eqn(blk, t):
             return (
                 blk.properties_out[t].conc_mass_comp["SO4_2-"]

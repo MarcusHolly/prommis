@@ -231,9 +231,6 @@ _log = idaeslog.getLogger(__name__)
 # Epsilon represents near-zero component concentrations
 eps = 1e-8 * units.mg / units.L
 
-# Finally fixed all the DOF issues, but now initialization is failing. Recently added manual initialization for an SX model
-# and will likely need to do the same for more unit models until I can update the tear guesses with an initial solution
-
 def main():
     """
     Run the flowsheet by calling the appropriate functions in series.
@@ -646,10 +643,6 @@ def build():
         source=m.fs.solex_rougher_scrub.aqueous_outlet,
         destination=m.fs.scrub_sep.inlet,
     )
-    # m.fs.sx_rougher_scrub_aq_outlet = Arc(
-    #     source=m.fs.scrub_sep.recycle,
-    #     destination=m.fs.leach_mixer.scrub_recycle,
-    # )
     m.fs.sx_rougher_scrub_aq_translator = Arc(
         source=m.fs.scrub_sep.recycle,
         destination=m.fs.scrubber_HCl_leach_translator.inlet,
@@ -691,10 +684,6 @@ def build():
         source=m.fs.cleaner_mixer.outlet,
         destination=m.fs.solex_cleaner_load.organic_inlet,
     )
-    # m.fs.sx_cleaner_load_aq_outlet = Arc(
-    #     source=m.fs.solex_cleaner_load.aqueous_outlet,
-    #     destination=m.fs.leach_sx_mixer.cleaner,
-    # )
     m.fs.sx_cleaner_load_aq_outlet_translator = Arc(
         source=m.fs.solex_cleaner_load.aqueous_outlet,
         destination=m.fs.cleaner_HCl_leach_translator.inlet,
