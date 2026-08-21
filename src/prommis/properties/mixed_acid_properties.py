@@ -563,7 +563,7 @@ class MixedAcidStateBlockData(StateBlockData):
 
         self.temperature = Var(
             domain=Reals,
-            initialize=298.15,
+            initialize=303.0,
             bounds=(298.1, None),
             doc="State temperature [K]",
             units=units.K,
@@ -576,6 +576,12 @@ class MixedAcidStateBlockData(StateBlockData):
             doc="State pressure [Pa]",
             units=units.Pa,
         )
+
+        import idaes.core.util.scaling as iscale
+        iscale.set_scaling_factor(self.flow_vol, 1e1)
+        iscale.set_scaling_factor(self.conc_mass_comp, 1e2)
+        iscale.set_scaling_factor(self.flow_mol_comp, 1e3)
+        iscale.set_scaling_factor(self.conc_mol_comp, 1e5)
 
         # Concentration conversion constraint
         @self.Constraint(self.params.component_list)
