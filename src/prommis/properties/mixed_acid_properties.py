@@ -581,6 +581,9 @@ class MixedAcidStateBlockData(StateBlockData):
             units=units.Pa,
         )
 
+        # TODO: These scaling factors are copied from the now unused precipitate_liquid_properties
+        # The flowsheet appears to initialize better with the vars scaled in this manner rather than
+        # adjusting the default scaling factors in the flowsheet with the new scaling tools... need to look into this more
         import idaes.core.util.scaling as iscale
         iscale.set_scaling_factor(self.flow_vol, 1e1)
         iscale.set_scaling_factor(self.conc_mass_comp, 1e2)
