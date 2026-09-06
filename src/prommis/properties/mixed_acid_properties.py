@@ -121,6 +121,10 @@ class MixedAcidPropertiesScaler(CustomScalerBase):
         "conc_mass_comp[Asc_-]": 100,
         "conc_mass_comp[HDha]": 1,
         "conc_mass_comp[Dha_-]": 100,
+        "conc_mol_comp[H2O]": 1e-1,
+        "conc_mol_comp[H_+]": 1, # or 1e1
+        "conc_mol_comp[Cl_-]": 1e2, # or 1e3
+        "conc_mol_comp[HSO4_-]": 1e2, # or 1e3
         # Use a large scaling factor for pH
         # to encourage the solver to take
         # smaller steps

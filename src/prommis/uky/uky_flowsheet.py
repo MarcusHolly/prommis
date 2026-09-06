@@ -139,6 +139,7 @@ References:
 """
 
 import logging
+import time
 
 from pyomo.common.collections import ComponentMap
 from pyomo.contrib.incidence_analysis import solve_strongly_connected_components
@@ -150,6 +151,7 @@ from pyomo.environ import (
     Objective,
     Param,
     Set,
+    TerminationCondition,
     TransformationFactory,
     Var,
     check_optimal_termination,
@@ -252,15 +254,52 @@ def main():
             "For more guidance, run assert_no_structural_warnings from the IDAES DiagnosticToolbox "
         )
 
+
+    import idaes.core.util.scaling as iscale
+    # Custom scaling visualization tools
+    # badly_scaled_var_list = iscale.badly_scaled_var_generator(m, large=1e2, small=1e-2)
+    # print("----------------   badly_scaled_var_list   ----------------")
+    # for x in badly_scaled_var_list:
+    #     print(f"{x[0].name}\t{x[0].value}\tsf: {iscale.get_scaling_factor(x[0])}")
+
+    # from idaes.core.scaling import report_scaling_factors
+    #
+    # print("--- Scaling Factors ---")
+    # report_scaling_factors(m, descend_into=True)
+
     initialize_system(m)
 
+    print("1st Solve")
     solve_system(m, tee=True)
+
+    print("--- conc_mass_comp Scaling Factors ---")
+    for v in m.component_data_objects(Var, descend_into=True):
+        if "conc_mass_comp" in v.name:
+            print(
+                f"{v.name}: "
+                f"value={value(v):.6e}, "
+                f"scaling={get_scaling_factor(v)}"
+            )
+
+    print("Initialized tear guesses after 1st solve")
+    m.fs.leach.liquid_inlet.display()
+    m.fs.solex_rougher_load.organic_inlet.display()
+    m.fs.solex_rougher_load.aqueous_inlet.display()
+    m.fs.solex_cleaner_load.organic_inlet.display()
+    m.fs.solex_cleaner_load.aqueous_inlet.display()
 
     # fixes the volumetric flow rate of the organic recycle streams and unfixes the flow of the make-up streams
     # we want to be able to adjust the total recycle flow rate, not just the make-up portion of it
     fix_organic_recycle(m)
 
+    print("2nd Solve")
     results = solve_system(m, tee=True)
+    print("Initialized tear guesses after 2nd solve")
+    m.fs.leach.liquid_inlet.display()
+    m.fs.solex_rougher_load.organic_inlet.display()
+    m.fs.solex_rougher_load.aqueous_inlet.display()
+    m.fs.solex_cleaner_load.organic_inlet.display()
+    m.fs.solex_cleaner_load.aqueous_inlet.display()
 
     if not check_optimal_termination(results):
         raise RuntimeError(
@@ -276,7 +315,14 @@ def main():
     dt = DiagnosticsToolbox(m)
     dt.assert_no_structural_warnings()
 
+    print("3rd Solve")
     solve_system(m, tee=True)
+    print("Initialized tear guesses after 3rd solve")
+    m.fs.leach.liquid_inlet.display()
+    m.fs.solex_rougher_load.organic_inlet.display()
+    m.fs.solex_rougher_load.aqueous_inlet.display()
+    m.fs.solex_cleaner_load.organic_inlet.display()
+    m.fs.solex_cleaner_load.aqueous_inlet.display()
 
     dt.assert_no_numerical_warnings()
 
@@ -753,15 +799,23 @@ def set_scaling(m):
     Args:
         m: pyomo model
     """
-
     leach_properties_scaler = m.fs.leach_soln.default_state_scaler_class()
     HCl_properties_scaler = m.fs.HCl_stripping_params.default_state_scaler_class()
     vapor_properties_scaler = m.fs.prop_gas.default_state_scaler_class()
 
-    leach_properties_scaler.default_scaling_factors["flow_vol"] = 1
-    HCl_properties_scaler.default_scaling_factors["flow_vol"] = 1
-    HCl_properties_scaler.default_scaling_factors["conc_mass_comp[H_+]"] = 1e-3
-    HCl_properties_scaler.default_scaling_factors["conc_mass_comp[Cl_-]"] = 1e-5
+    # These are the default scaling factors set by iscale in mixed_acid_properties
+    # leach_properties_scaler.default_scaling_factors["flow_vol"] = 1e1
+    # HCl_properties_scaler.default_scaling_factors["flow_vol"] = 1e1
+    # leach_properties_scaler.default_scaling_factors["flow_mol_comp"] = 1e3
+    # HCl_properties_scaler.default_scaling_factors["flow_mol_comp"] = 1e3
+    # leach_properties_scaler.default_scaling_factors["conc_mol_comp"] = 1e5
+    # HCl_properties_scaler.default_scaling_factors["conc_mol_comp"] = 1e5
+    # leach_properties_scaler.default_scaling_factors["conc_mass_comp"] = 1e2
+    # HCl_properties_scaler.default_scaling_factors["conc_mass_comp"] = 1e2
+
+    # HCl_properties_scaler.default_scaling_factors["conc_mass_comp[H_+]"] = 1e-3
+    # HCl_properties_scaler.default_scaling_factors["conc_mass_comp[Cl_-]"] = 1e-5
+
     vapor_properties_scaler.default_scaling_factors["flow_mol_phase"] = 1 / 0.00781
 
     m.fs.HCl_stripping_params.default_state_scaler_object = HCl_properties_scaler
@@ -812,7 +866,7 @@ def set_operating_conditions(m, DEHPA_dosage=0.2):
     dehpa_conc = 975.8e3 * dosage * units.mg / units.L
     kerosene_conc = 8.2e5 * units.mg / units.L
     Temp_room = 303 * units.K
-    P_atm = 101235 * units.Pa
+    P_atm = 101325 * units.Pa
 
     m.fs.leach_liquid_feed.properties[0.0].pressure.fix(P_atm)
     m.fs.leach_liquid_feed.properties[0.0].temperature.fix(Temp_room)
@@ -988,13 +1042,13 @@ def set_operating_conditions(m, DEHPA_dosage=0.2):
 
     m.fs.precip_sep.split_fraction[:, "recycle"].fix(0.9)
 
-    # Fix preciptator outlet temperature
+    # Fix precipitator outlet temperature
     m.fs.precipitator.precipitate_state_block[0].temperature.fix(348.15 * units.K)
 
     # Roaster gas feed
     m.fs.roaster.deltaP.fix(0)
     m.fs.roaster.gas_inlet.temperature.fix(1330)
-    m.fs.roaster.gas_inlet.pressure.fix(101325)
+    m.fs.roaster.gas_inlet.pressure.fix(P_atm)
     # Inlet flue gas mole flow rate
     fgas = 0.00781
     # Inlet flue gas composition, typical flue gas by burning CH4 with air with stoichiometric ratio of 2.3
@@ -1067,6 +1121,8 @@ def initialize_system(m):
 
     tear_guesses1 = {
         "flow_vol": {0: 288.18},
+        "temperature": {0: 303},
+        "pressure": {0: 101325},
         "conc_mass_comp": {
             (0, "Al_3+"): 1759.30,
             (0, "Ca_2+"): 228.06,
@@ -1089,6 +1145,8 @@ def initialize_system(m):
     }
     tear_guesses2 = {
         "flow_vol": {0: 128.95},
+        "temperature": {0: 303},
+        "pressure": {0: 101325},
         "conc_mass_comp": {
             (0, "Al_o"): 73.38,
             (0, "Ca_o"): 13.24,
@@ -1108,6 +1166,8 @@ def initialize_system(m):
     }
     tear_guesses3 = {
         "flow_vol": {0: 208.99},
+        "temperature": {0: 303},
+        "pressure": {0: 101325},
         "conc_mass_comp": {
             (0, "Al_3+"): 2738.65,
             (0, "Ca_2+"): 355.51,
@@ -1130,6 +1190,8 @@ def initialize_system(m):
     }
     tear_guesses4 = {
         "flow_vol": {0: 603.34},
+        "temperature": {0: 303},
+        "pressure": {0: 101325},
         "conc_mass_comp": {
             (0, "Al_o"): 36.41,
             (0, "Ca_o"): 5.38,
@@ -1149,6 +1211,8 @@ def initialize_system(m):
     }
     tear_guesses5 = {
         "flow_vol": {0: 6.91},
+        "temperature": {0: 303},
+        "pressure": {0: 101325},
         "conc_mass_comp": {
             (0, "Al_3+"): 1588.08,
             (0, "Ca_2+"): 197.47,
@@ -1217,9 +1281,9 @@ def initialize_system(m):
     initializer_sx = SolventExtractionInitializer()
     sx_units = [
         m.fs.solex_rougher_load,
-        # m.fs.solex_rougher_scrub,
+        m.fs.solex_rougher_scrub,
         m.fs.solex_rougher_strip,
-        # m.fs.solex_cleaner_load,
+        m.fs.solex_cleaner_load,
         m.fs.solex_cleaner_strip,
     ]
 
@@ -1239,8 +1303,28 @@ def initialize_system(m):
             m.fs.leach.solid_inlet.flow_mass.fix()
             m.fs.leach.solid_inlet.mass_frac_comp.fix()
 
+            from pyomo.util.calc_var_value import calculate_variable_from_constraint
+            blk = m.fs.leach.mscontactor.liquid_inlet_state[0]
+            for j in blk.flow_mol_comp:
+                calculate_variable_from_constraint(blk.flow_mol_comp[j], blk.flow_mol_comp_eqn[j])
+
             solver = get_solver()
-            solver.solve(m.fs.leach, tee=True)
+            # halt error related to Al2O3 rxn rate, where the exponent value is A
+            solver.options["halt_on_ampl_error"] = "yes"
+            # solver.options["nlp_scaling_method"] = "user-scaling"
+            # solver.solve(m.fs.leach, tee=True)
+            print(solver.options)
+
+            from idaes.core.util.model_statistics import large_residuals_set
+            print("Large Residuals")
+            none_count = 0
+            for c in large_residuals_set(m.fs.leach, tol=1.0):
+                v = value(c.body, exception=False)
+                if v is None:
+                    none_count += 1
+                else:
+                    print(c.name, "=", v)
+            print("skipped (still uninitialized):", none_count)
 
             m.fs.leach.liquid_inlet.flow_vol.unfix()
             m.fs.leach.liquid_inlet.conc_mass_comp.unfix()
@@ -1249,106 +1333,109 @@ def initialize_system(m):
 
             m.fs.leach.solid_inlet.flow_mass.unfix()
             m.fs.leach.solid_inlet.mass_frac_comp.unfix()
+        #
+        # elif unit == m.fs.solex_cleaner_load:
+        #     _log.info(f"Manually initializing {unit}")
+        #     m.fs.solex_cleaner_load.aqueous_inlet.flow_vol.fix()
+        #     m.fs.solex_cleaner_load.aqueous_inlet.conc_mass_comp.fix()
+        #     m.fs.solex_cleaner_load.aqueous_inlet.temperature.fix()
+        #     m.fs.solex_cleaner_load.aqueous_inlet.pressure.fix()
+        #
+        #     m.fs.solex_cleaner_load.organic_inlet.flow_vol.fix()
+        #     m.fs.solex_cleaner_load.organic_inlet.conc_mass_comp.fix()
+        #     m.fs.solex_cleaner_load.organic_inlet.temperature.fix()
+        #     m.fs.solex_cleaner_load.organic_inlet.pressure.fix()
+        #
+        #     solver = get_solver()
+        #     solver.solve(m.fs.solex_cleaner_load, tee=True)
+        #
+        #     m.fs.solex_cleaner_load.aqueous_inlet.flow_vol.unfix()
+        #     m.fs.solex_cleaner_load.aqueous_inlet.conc_mass_comp.unfix()
+        #     m.fs.solex_cleaner_load.aqueous_inlet.temperature.unfix()
+        #     m.fs.solex_cleaner_load.aqueous_inlet.pressure.unfix()
+        #
+        #     m.fs.solex_cleaner_load.organic_inlet.flow_vol.unfix()
+        #     m.fs.solex_cleaner_load.organic_inlet.conc_mass_comp.unfix()
+        #     m.fs.solex_cleaner_load.organic_inlet.temperature.unfix()
+        #     m.fs.solex_cleaner_load.organic_inlet.pressure.unfix()
+        #
+        # elif unit == m.fs.solex_rougher_scrub:
+        #     _log.info(f"Manually initializing {unit}")
+        #     m.fs.solex_rougher_scrub.aqueous_inlet.flow_vol.fix()
+        #     m.fs.solex_rougher_scrub.aqueous_inlet.conc_mass_comp.fix()
+        #     m.fs.solex_rougher_scrub.aqueous_inlet.temperature.fix()
+        #     m.fs.solex_rougher_scrub.aqueous_inlet.pressure.fix()
+        #
+        #     m.fs.solex_rougher_scrub.organic_inlet.flow_vol.fix()
+        #     m.fs.solex_rougher_scrub.organic_inlet.conc_mass_comp.fix()
+        #     m.fs.solex_rougher_scrub.organic_inlet.temperature.fix()
+        #     m.fs.solex_rougher_scrub.organic_inlet.pressure.fix()
+        #
+        #     solver = get_solver()
+        #     # solver.options["nlp_scaling_method"] = "user-scaling"
+        #     solver.solve(m.fs.solex_rougher_scrub, tee=True)
+        #
+        #     m.fs.solex_rougher_scrub.aqueous_inlet.flow_vol.unfix()
+        #     m.fs.solex_rougher_scrub.aqueous_inlet.conc_mass_comp.unfix()
+        #     m.fs.solex_rougher_scrub.aqueous_inlet.temperature.unfix()
+        #     m.fs.solex_rougher_scrub.aqueous_inlet.pressure.unfix()
+        #
+        #     m.fs.solex_rougher_scrub.organic_inlet.flow_vol.unfix()
+        #     m.fs.solex_rougher_scrub.organic_inlet.conc_mass_comp.unfix()
+        #     m.fs.solex_rougher_scrub.organic_inlet.temperature.unfix()
+        #     m.fs.solex_rougher_scrub.organic_inlet.pressure.unfix()
 
-        elif unit == m.fs.solex_cleaner_load:
-            _log.info(f"Manually initializing {unit}")
-            m.fs.solex_cleaner_load.aqueous_inlet.flow_vol.fix()
-            m.fs.solex_cleaner_load.aqueous_inlet.conc_mass_comp.fix()
-            m.fs.solex_cleaner_load.aqueous_inlet.temperature.fix()
-            m.fs.solex_cleaner_load.aqueous_inlet.pressure.fix()
+        # elif unit == m.fs.solex_rougher_strip:
+        #     _log.info(f"Manually initializing {unit}")
+        #     m.fs.solex_rougher_strip.aqueous_inlet.flow_vol.fix()
+        #     m.fs.solex_rougher_strip.aqueous_inlet.conc_mass_comp.fix()
+        #     m.fs.solex_rougher_strip.aqueous_inlet.temperature.fix()
+        #     m.fs.solex_rougher_strip.aqueous_inlet.pressure.fix()
+        #
+        #     m.fs.solex_rougher_strip.organic_inlet.flow_vol.fix()
+        #     m.fs.solex_rougher_strip.organic_inlet.conc_mass_comp.fix()
+        #     m.fs.solex_rougher_strip.organic_inlet.temperature.fix()
+        #     m.fs.solex_rougher_strip.organic_inlet.pressure.fix()
+        #
+        #     solver = get_solver()
+        #     # solver.options["nlp_scaling_method"] = "user-scaling"
+        #     solver.solve(m.fs.solex_rougher_strip, tee=True)
+        #
+        #     m.fs.solex_rougher_strip.aqueous_inlet.flow_vol.unfix()
+        #     m.fs.solex_rougher_strip.aqueous_inlet.conc_mass_comp.unfix()
+        #     m.fs.solex_rougher_strip.aqueous_inlet.temperature.unfix()
+        #     m.fs.solex_rougher_strip.aqueous_inlet.pressure.unfix()
+        #
+        #     m.fs.solex_rougher_strip.organic_inlet.flow_vol.unfix()
+        #     m.fs.solex_rougher_strip.organic_inlet.conc_mass_comp.unfix()
+        #     m.fs.solex_rougher_strip.organic_inlet.temperature.unfix()
+        #     m.fs.solex_rougher_strip.organic_inlet.pressure.unfix()
 
-            m.fs.solex_cleaner_load.organic_inlet.flow_vol.fix()
-            m.fs.solex_cleaner_load.organic_inlet.conc_mass_comp.fix()
-            m.fs.solex_cleaner_load.organic_inlet.temperature.fix()
-            m.fs.solex_cleaner_load.organic_inlet.pressure.fix()
-
-            solver = get_solver()
-            solver.solve(m.fs.solex_cleaner_load, tee=True)
-
-            m.fs.solex_cleaner_load.aqueous_inlet.flow_vol.unfix()
-            m.fs.solex_cleaner_load.aqueous_inlet.conc_mass_comp.unfix()
-            m.fs.solex_cleaner_load.aqueous_inlet.temperature.unfix()
-            m.fs.solex_cleaner_load.aqueous_inlet.pressure.unfix()
-
-            m.fs.solex_cleaner_load.organic_inlet.flow_vol.unfix()
-            m.fs.solex_cleaner_load.organic_inlet.conc_mass_comp.unfix()
-            m.fs.solex_cleaner_load.organic_inlet.temperature.unfix()
-            m.fs.solex_cleaner_load.organic_inlet.pressure.unfix()
-
-        elif unit == m.fs.solex_rougher_scrub:
-            _log.info(f"Manually initializing {unit}")
-            m.fs.solex_rougher_scrub.aqueous_inlet.flow_vol.fix()
-            m.fs.solex_rougher_scrub.aqueous_inlet.conc_mass_comp.fix()
-            m.fs.solex_rougher_scrub.aqueous_inlet.temperature.fix()
-            m.fs.solex_rougher_scrub.aqueous_inlet.pressure.fix()
-
-            m.fs.solex_rougher_scrub.organic_inlet.flow_vol.fix()
-            m.fs.solex_rougher_scrub.organic_inlet.conc_mass_comp.fix()
-            m.fs.solex_rougher_scrub.organic_inlet.temperature.fix()
-            m.fs.solex_rougher_scrub.organic_inlet.pressure.fix()
-
-            solver = get_solver()
-            solver.solve(m.fs.solex_rougher_scrub, tee=True)
-
-            m.fs.solex_rougher_scrub.aqueous_inlet.flow_vol.unfix()
-            m.fs.solex_rougher_scrub.aqueous_inlet.conc_mass_comp.unfix()
-            m.fs.solex_rougher_scrub.aqueous_inlet.temperature.unfix()
-            m.fs.solex_rougher_scrub.aqueous_inlet.pressure.unfix()
-
-            m.fs.solex_rougher_scrub.organic_inlet.flow_vol.unfix()
-            m.fs.solex_rougher_scrub.organic_inlet.conc_mass_comp.unfix()
-            m.fs.solex_rougher_scrub.organic_inlet.temperature.unfix()
-            m.fs.solex_rougher_scrub.organic_inlet.pressure.unfix()
-
-        elif unit == m.fs.solex_rougher_strip:
-            _log.info(f"Manually initializing {unit}")
-            m.fs.solex_rougher_strip.aqueous_inlet.flow_vol.fix()
-            m.fs.solex_rougher_strip.aqueous_inlet.conc_mass_comp.fix()
-            m.fs.solex_rougher_strip.aqueous_inlet.temperature.fix()
-            m.fs.solex_rougher_strip.aqueous_inlet.pressure.fix()
-
-            m.fs.solex_rougher_strip.organic_inlet.flow_vol.fix()
-            m.fs.solex_rougher_strip.organic_inlet.conc_mass_comp.fix()
-            m.fs.solex_rougher_strip.organic_inlet.temperature.fix()
-            m.fs.solex_rougher_strip.organic_inlet.pressure.fix()
-
-            solver = get_solver()
-            solver.solve(m.fs.solex_rougher_strip, tee=True)
-
-            m.fs.solex_rougher_strip.aqueous_inlet.flow_vol.unfix()
-            m.fs.solex_rougher_strip.aqueous_inlet.conc_mass_comp.unfix()
-            m.fs.solex_rougher_strip.aqueous_inlet.temperature.unfix()
-            m.fs.solex_rougher_strip.aqueous_inlet.pressure.unfix()
-
-            m.fs.solex_rougher_strip.organic_inlet.flow_vol.unfix()
-            m.fs.solex_rougher_strip.organic_inlet.conc_mass_comp.unfix()
-            m.fs.solex_rougher_strip.organic_inlet.temperature.unfix()
-            m.fs.solex_rougher_strip.organic_inlet.pressure.unfix()
-
-        elif unit == m.fs.solex_cleaner_strip:
-            _log.info(f"Manually initializing {unit}")
-            m.fs.solex_cleaner_strip.aqueous_inlet.flow_vol.fix()
-            m.fs.solex_cleaner_strip.aqueous_inlet.conc_mass_comp.fix()
-            m.fs.solex_cleaner_strip.aqueous_inlet.temperature.fix()
-            m.fs.solex_cleaner_strip.aqueous_inlet.pressure.fix()
-
-            m.fs.solex_cleaner_strip.organic_inlet.flow_vol.fix()
-            m.fs.solex_cleaner_strip.organic_inlet.conc_mass_comp.fix()
-            m.fs.solex_cleaner_strip.organic_inlet.temperature.fix()
-            m.fs.solex_cleaner_strip.organic_inlet.pressure.fix()
-
-            solver = get_solver()
-            solver.solve(m.fs.solex_cleaner_strip, tee=True)
-
-            m.fs.solex_cleaner_strip.aqueous_inlet.flow_vol.unfix()
-            m.fs.solex_cleaner_strip.aqueous_inlet.conc_mass_comp.unfix()
-            m.fs.solex_cleaner_strip.aqueous_inlet.temperature.unfix()
-            m.fs.solex_cleaner_strip.aqueous_inlet.pressure.unfix()
-
-            m.fs.solex_cleaner_strip.organic_inlet.flow_vol.unfix()
-            m.fs.solex_cleaner_strip.organic_inlet.conc_mass_comp.unfix()
-            m.fs.solex_cleaner_strip.organic_inlet.temperature.unfix()
-            m.fs.solex_cleaner_strip.organic_inlet.pressure.unfix()
+        # elif unit == m.fs.solex_cleaner_strip:
+        #     _log.info(f"Manually initializing {unit}")
+        #     m.fs.solex_cleaner_strip.aqueous_inlet.flow_vol.fix()
+        #     m.fs.solex_cleaner_strip.aqueous_inlet.conc_mass_comp.fix()
+        #     m.fs.solex_cleaner_strip.aqueous_inlet.temperature.fix()
+        #     m.fs.solex_cleaner_strip.aqueous_inlet.pressure.fix()
+        #
+        #     m.fs.solex_cleaner_strip.organic_inlet.flow_vol.fix()
+        #     m.fs.solex_cleaner_strip.organic_inlet.conc_mass_comp.fix()
+        #     m.fs.solex_cleaner_strip.organic_inlet.temperature.fix()
+        #     m.fs.solex_cleaner_strip.organic_inlet.pressure.fix()
+        #
+        #     solver = get_solver()
+        #     # solver.options["nlp_scaling_method"] = "user-scaling"
+        #     solver.solve(m.fs.solex_cleaner_strip, tee=True)
+        #
+        #     m.fs.solex_cleaner_strip.aqueous_inlet.flow_vol.unfix()
+        #     m.fs.solex_cleaner_strip.aqueous_inlet.conc_mass_comp.unfix()
+        #     m.fs.solex_cleaner_strip.aqueous_inlet.temperature.unfix()
+        #     m.fs.solex_cleaner_strip.aqueous_inlet.pressure.unfix()
+        #
+        #     m.fs.solex_cleaner_strip.organic_inlet.flow_vol.unfix()
+        #     m.fs.solex_cleaner_strip.organic_inlet.conc_mass_comp.unfix()
+        #     m.fs.solex_cleaner_strip.organic_inlet.temperature.unfix()
+        #     m.fs.solex_cleaner_strip.organic_inlet.pressure.unfix()
         #
         # elif unit == m.fs.cleaner_HCl_leach_translator:
         #     _log.info(f"Manually initializing {unit}")
@@ -1372,13 +1459,37 @@ def initialize_system(m):
         #     m.fs.precipitator.aqueous_inlet.temperature.fix()
         #     m.fs.precipitator.aqueous_inlet.pressure.fix()
         #
+        #     m.fs.precipitator.cv_aqueous.properties_in[0].conc_mass_comp["HC2O4_-"].unfix()
+        #     m.fs.precipitator.cv_aqueous.properties_in[0].conc_mass_comp["C2O4_2-"].unfix()
+        #
         #     solver = get_solver()
+        #     # solver.options["nlp_scaling_method"] = "user-scaling"
         #     solver.solve(m.fs.precipitator, tee=True)
         #
         #     m.fs.precipitator.aqueous_inlet.flow_vol.unfix()
         #     m.fs.precipitator.aqueous_inlet.conc_mass_comp.unfix()
         #     m.fs.precipitator.aqueous_inlet.temperature.unfix()
         #     m.fs.precipitator.aqueous_inlet.pressure.unfix()
+        # elif unit == m.fs.sl_sep2:
+        #     _log.info(f"Manually initializing {unit}")
+        #     m.fs.sl_sep2.liquid_inlet.flow_vol.fix()
+        #     m.fs.sl_sep2.liquid_inlet.conc_mass_comp.fix()
+        #     m.fs.sl_sep2.liquid_inlet.temperature.fix()
+        #     m.fs.sl_sep2.liquid_inlet.pressure.fix()
+        #
+        #     m.fs.sl_sep2.solid_inlet.flow_mol_comp.fix()
+        #     m.fs.sl_sep2.solid_inlet.temperature.fix()
+        #
+        #     solver = get_solver()
+        #     solver.solve(m.fs.sl_sep2, tee=True)
+        #
+        #     m.fs.sl_sep2.liquid_inlet.flow_vol.unfix()
+        #     m.fs.sl_sep2.liquid_inlet.conc_mass_comp.unfix()
+        #     m.fs.sl_sep2.liquid_inlet.temperature.unfix()
+        #     m.fs.sl_sep2.liquid_inlet.pressure.unfix()
+        #
+        #     m.fs.sl_sep2.solid_inlet.flow_mol_comp.unfix()
+        #     m.fs.sl_sep2.solid_inlet.temperature.unfix()
 
         elif unit in product_units:
             _log.info(f"Initializing {unit}")
@@ -1414,7 +1525,11 @@ def solve_system(m, solver_obj=None, tee=False):
     if solver_obj is None:
         # Why isn't it getting ipopt_v2 automatically?
         solver_obj = get_solver("ipopt_v2")
-    solver_obj.options.constr_viol_tol = 1e-8
+    # solver_obj.options.constr_viol_tol = 1e-8
+    solver_obj.options.constr_viol_tol = 1e-6
+    solver_obj.options["nlp_scaling_method"] = "user-scaling"
+    # solver_obj.options["halt_on_ampl_error"] = "yes"
+    solver_obj.options["max_iter"] = 300
 
     results = solver_obj.solve(m, tee=tee)
 
@@ -3037,5 +3152,6 @@ def data_reconcilliation(m):
 
 if __name__ == "__main__":
     m, results = main()
-    optimize_model(m)
+    # print("4th Solve")
+    # optimize_model(m)
     # data_reconcilliation(m)
