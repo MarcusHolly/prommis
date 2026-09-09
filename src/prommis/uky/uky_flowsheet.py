@@ -233,6 +233,8 @@ _log = idaeslog.getLogger(__name__)
 # Epsilon represents near-zero component concentrations
 eps = 1e-8 * units.mg / units.L
 
+#TODO: Evaluate where oxalic acid is coming from and if a feed stream is necessary
+
 def main():
     """
     Run the flowsheet by calling the appropriate functions in series.
@@ -272,14 +274,14 @@ def main():
     print("1st Solve")
     solve_system(m, tee=True)
 
-    print("--- conc_mass_comp Scaling Factors ---")
-    for v in m.component_data_objects(Var, descend_into=True):
-        if "conc_mass_comp" in v.name:
-            print(
-                f"{v.name}: "
-                f"value={value(v):.6e}, "
-                f"scaling={get_scaling_factor(v)}"
-            )
+    # print("--- Oxalic Acid Species ---")
+    # for v in m.component_data_objects(Var, descend_into=True):
+    #     if any(species in v.name for species in ["H2C2O4", "HC2O4_-", "C2O4_2-"]):
+    #         print(
+    #             f"{v.name}: "
+    #             f"value={value(v):.6e}, "
+    #             f"scaling={get_scaling_factor(v)}"
+    #         )
 
     print("Initialized tear guesses after 1st solve")
     m.fs.leach.liquid_inlet.display()
@@ -338,11 +340,15 @@ def build():
     m = ConcreteModel()
     m.fs = FlowsheetBlock(dynamic=False)
 
-    # Leaching property and unit models
+    # Mixed acid property models
     m.fs.leach_soln = MixedAcidParameterBlock(include_sulfates=True)
+    #TOOD: Add config option for this to disable one or both pKa's
+    m.fs.sx_soln = MixedAcidParameterBlock()
+    m.fs.precip_soln = MixedAcidParameterBlock(include_oxalates=True)
+
+    # Leaching property and unit models
     m.fs.coal = CoalRefuseParameters()
     m.fs.leach_rxns = CoalRefuseLeachingReactionParameterBlock()
-    m.fs.HCl_stripping_params = MixedAcidParameterBlock(include_oxalates=True)
 
     m.fs.leach = LeachingTrain(
         number_of_tanks=2,
@@ -368,7 +374,7 @@ def build():
     )
 
     m.fs.scrubber_HCl_leach_translator = TranslatorHClLeach(
-        inlet_property_package=m.fs.HCl_stripping_params,
+        inlet_property_package=m.fs.precip_soln,
         outlet_property_package=m.fs.leach_soln,
         outlet_state_defined=True,
     )
@@ -414,13 +420,13 @@ def build():
         create_hydrostatic_pressure_terms=False,
     )
 
-    m.fs.acid_feed1 = Feed(property_package=m.fs.HCl_stripping_params)
+    m.fs.acid_feed1 = Feed(property_package=m.fs.precip_soln)
 
     m.fs.solex_rougher_scrub = SolventExtraction(
         number_of_finite_elements=1,
         dynamic=False,
         aqueous_stream={
-            "property_package": m.fs.HCl_stripping_params,
+            "property_package": m.fs.precip_soln,
             "flow_direction": FlowDirection.backward,
             "has_energy_balance": False,
             "has_pressure_balance": False,
@@ -436,13 +442,13 @@ def build():
         create_hydrostatic_pressure_terms=False,
     )
 
-    m.fs.acid_feed2 = Feed(property_package=m.fs.HCl_stripping_params)
+    m.fs.acid_feed2 = Feed(property_package=m.fs.precip_soln)
 
     m.fs.solex_rougher_strip = SolventExtraction(
         number_of_finite_elements=2,
         dynamic=False,
         aqueous_stream={
-            "property_package": m.fs.HCl_stripping_params,
+            "property_package": m.fs.precip_soln,
             "flow_direction": FlowDirection.backward,
             "has_energy_balance": False,
             "has_pressure_balance": False,
@@ -484,7 +490,7 @@ def build():
         energy_split_basis=EnergySplittingType.none,
     )
     m.fs.scrub_sep = Separator(
-        property_package=m.fs.HCl_stripping_params,
+        property_package=m.fs.precip_soln,
         outlet_list=["recycle", "purge"],
         split_basis=SplittingType.totalFlow,
         material_balance_type=MaterialBalanceType.componentTotal,
@@ -498,7 +504,7 @@ def build():
         number_of_finite_elements=3,
         dynamic=False,
         aqueous_stream={
-            "property_package": m.fs.HCl_stripping_params,
+            "property_package": m.fs.precip_soln,
             "flow_direction": FlowDirection.forward,
             "has_energy_balance": False,
             "has_pressure_balance": False,
@@ -518,7 +524,7 @@ def build():
         number_of_finite_elements=3,
         dynamic=False,
         aqueous_stream={
-            "property_package": m.fs.HCl_stripping_params,
+            "property_package": m.fs.precip_soln,
             "flow_direction": FlowDirection.backward,
             "has_energy_balance": False,
             "has_pressure_balance": False,
@@ -555,7 +561,7 @@ def build():
     )
 
     m.fs.cleaner_HCl_leach_translator = TranslatorHClLeach(
-        inlet_property_package=m.fs.HCl_stripping_params,
+        inlet_property_package=m.fs.precip_soln,
         outlet_property_package=m.fs.leach_soln,
         outlet_state_defined=True,
     )
@@ -569,7 +575,7 @@ def build():
         momentum_mixing_type=MomentumMixingType.none,
     )
 
-    m.fs.acid_feed3 = Feed(property_package=m.fs.HCl_stripping_params)
+    m.fs.acid_feed3 = Feed(property_package=m.fs.precip_soln)
     m.fs.cleaner_organic_purge = Product(property_package=m.fs.prop_o)
 
     # --------------------------------------------------------------------------------------------------------------
@@ -578,21 +584,21 @@ def build():
     m.fs.properties_solid = PrecipitateParameters()
 
     m.fs.precipitator = Precipitator(
-        property_package_aqueous=m.fs.HCl_stripping_params,
+        property_package_aqueous=m.fs.precip_soln,
         property_package_precipitate=m.fs.properties_solid,
         make_volume_balance_constraint=False,
     )
 
     m.fs.sl_sep2 = SLSeparator(
         solid_property_package=m.fs.properties_solid,
-        liquid_property_package=m.fs.HCl_stripping_params,
+        liquid_property_package=m.fs.precip_soln,
         material_balance_type=MaterialBalanceType.componentTotal,
         momentum_balance_type=MomentumBalanceType.none,
         energy_split_basis=EnergySplittingType.none,
     )
 
     m.fs.precip_sep = Separator(
-        property_package=m.fs.HCl_stripping_params,
+        property_package=m.fs.precip_soln,
         outlet_list=["recycle", "purge"],
         split_basis=SplittingType.totalFlow,
         material_balance_type=MaterialBalanceType.componentTotal,
@@ -601,7 +607,7 @@ def build():
     )
 
     m.fs.precip_sx_mixer = Mixer(
-        property_package=m.fs.HCl_stripping_params,
+        property_package=m.fs.precip_soln,
         num_inlets=2,
         inlet_list=["precip", "rougher"],
         material_balance_type=MaterialBalanceType.componentTotal,
@@ -609,7 +615,7 @@ def build():
         momentum_mixing_type=MomentumMixingType.none,
     )
 
-    m.fs.precip_purge = Product(property_package=m.fs.HCl_stripping_params)
+    m.fs.precip_purge = Product(property_package=m.fs.precip_soln)
     # -----------------------------------------------------------------------------------------------------------------
     # Roasting property and unit models
 
@@ -624,7 +630,7 @@ def build():
     m.fs.roaster = REEOxalateRoaster(
         property_package_gas=m.fs.prop_gas,
         property_package_precipitate_solid=m.fs.prop_solid,
-        property_package_precipitate_liquid=m.fs.HCl_stripping_params,
+        property_package_precipitate_liquid=m.fs.precip_soln,
         has_holdup=False,
         has_heat_transfer=True,
         has_pressure_change=True,
@@ -800,27 +806,32 @@ def set_scaling(m):
         m: pyomo model
     """
     leach_properties_scaler = m.fs.leach_soln.default_state_scaler_class()
-    HCl_properties_scaler = m.fs.HCl_stripping_params.default_state_scaler_class()
+    sx_properties_scaler = m.fs.sx_soln.default_state_scaler_class()
+    precip_properties_scaler = m.fs.precip_soln.default_state_scaler_class()
     vapor_properties_scaler = m.fs.prop_gas.default_state_scaler_class()
 
     # These are the default scaling factors set by iscale in mixed_acid_properties
-    # leach_properties_scaler.default_scaling_factors["flow_vol"] = 1e1
-    # HCl_properties_scaler.default_scaling_factors["flow_vol"] = 1e1
-    # leach_properties_scaler.default_scaling_factors["flow_mol_comp"] = 1e3
-    # HCl_properties_scaler.default_scaling_factors["flow_mol_comp"] = 1e3
-    # leach_properties_scaler.default_scaling_factors["conc_mol_comp"] = 1e5
-    # HCl_properties_scaler.default_scaling_factors["conc_mol_comp"] = 1e5
-    # leach_properties_scaler.default_scaling_factors["conc_mass_comp"] = 1e2
-    # HCl_properties_scaler.default_scaling_factors["conc_mass_comp"] = 1e2
+    leach_properties_scaler.default_scaling_factors["flow_vol"] = 1e1
+    leach_properties_scaler.default_scaling_factors["flow_mol_comp"] = 1e3
+    leach_properties_scaler.default_scaling_factors["conc_mass_comp"] = 1e2
+
+    precip_properties_scaler.default_scaling_factors["flow_vol"] = 1e1
+    precip_properties_scaler.default_scaling_factors["flow_mol_comp"] = 1e3
+    precip_properties_scaler.default_scaling_factors["conc_mass_comp"] = 1e2
+
+    sx_properties_scaler.default_scaling_factors["flow_vol"] = 1e1
+    sx_properties_scaler.default_scaling_factors["flow_mol_comp"] = 1e3
+    sx_properties_scaler.default_scaling_factors["conc_mass_comp"] = 1e2
 
     # HCl_properties_scaler.default_scaling_factors["conc_mass_comp[H_+]"] = 1e-3
     # HCl_properties_scaler.default_scaling_factors["conc_mass_comp[Cl_-]"] = 1e-5
 
     vapor_properties_scaler.default_scaling_factors["flow_mol_phase"] = 1 / 0.00781
 
-    m.fs.HCl_stripping_params.default_state_scaler_object = HCl_properties_scaler
-    m.fs.prop_gas.default_state_scaler_object = vapor_properties_scaler
     m.fs.leach_soln.default_state_scaler_object = leach_properties_scaler
+    m.fs.sx_soln.default_state_scaler_object = leach_properties_scaler
+    m.fs.precip_soln.default_state_scaler_object = precip_properties_scaler
+    m.fs.prop_gas.default_state_scaler_object = vapor_properties_scaler
 
     # Also use global mutation to change the max and min scaling factors
     # allowed from objects derived from CustomScalerBase, i.e., all the
@@ -1275,7 +1286,7 @@ def initialize_system(m):
 
     initializer_leach = LeachingTrainInitializer()
     leach_units = [
-        # m.fs.leach,
+        m.fs.leach,
     ]
 
     initializer_sx = SolventExtractionInitializer()
@@ -1293,46 +1304,47 @@ def initialize_system(m):
         if unit in feed_units:
             _log.info(f"Initializing {unit}")
             initializer_feed.initialize(unit)
-        elif unit == m.fs.leach:
-            _log.info(f"Manually initializing {unit}")
-            m.fs.leach.liquid_inlet.flow_vol.fix()
-            m.fs.leach.liquid_inlet.conc_mass_comp.fix()
-            m.fs.leach.liquid_inlet.temperature.fix()
-            m.fs.leach.liquid_inlet.pressure.fix()
-
-            m.fs.leach.solid_inlet.flow_mass.fix()
-            m.fs.leach.solid_inlet.mass_frac_comp.fix()
-
-            from pyomo.util.calc_var_value import calculate_variable_from_constraint
-            blk = m.fs.leach.mscontactor.liquid_inlet_state[0]
-            for j in blk.flow_mol_comp:
-                calculate_variable_from_constraint(blk.flow_mol_comp[j], blk.flow_mol_comp_eqn[j])
-
-            solver = get_solver()
-            # halt error related to Al2O3 rxn rate, where the exponent value is A
-            solver.options["halt_on_ampl_error"] = "yes"
-            # solver.options["nlp_scaling_method"] = "user-scaling"
-            # solver.solve(m.fs.leach, tee=True)
-            print(solver.options)
-
-            from idaes.core.util.model_statistics import large_residuals_set
-            print("Large Residuals")
-            none_count = 0
-            for c in large_residuals_set(m.fs.leach, tol=1.0):
-                v = value(c.body, exception=False)
-                if v is None:
-                    none_count += 1
-                else:
-                    print(c.name, "=", v)
-            print("skipped (still uninitialized):", none_count)
-
-            m.fs.leach.liquid_inlet.flow_vol.unfix()
-            m.fs.leach.liquid_inlet.conc_mass_comp.unfix()
-            m.fs.leach.liquid_inlet.temperature.unfix()
-            m.fs.leach.liquid_inlet.pressure.unfix()
-
-            m.fs.leach.solid_inlet.flow_mass.unfix()
-            m.fs.leach.solid_inlet.mass_frac_comp.unfix()
+        # elif unit == m.fs.leach:
+        #     _log.info(f"Manually initializing {unit}")
+        #     m.fs.leach.liquid_inlet.flow_vol.fix()
+        #     m.fs.leach.liquid_inlet.conc_mass_comp.fix()
+        #     m.fs.leach.liquid_inlet.temperature.fix()
+        #     m.fs.leach.liquid_inlet.pressure.fix()
+        #
+        #     m.fs.leach.solid_inlet.flow_mass.fix()
+        #     m.fs.leach.solid_inlet.mass_frac_comp.fix()
+        #
+        #     from pyomo.util.calc_var_value import calculate_variable_from_constraint
+        #     blk = m.fs.leach.mscontactor.liquid_inlet_state[0]
+        #     for j in blk.flow_mol_comp:
+        #         calculate_variable_from_constraint(blk.flow_mol_comp[j], blk.flow_mol_comp_eqn[j])
+        #
+        #     solver = get_solver()
+        #     # halt error related to Al2O3 rxn rate, where the exponent value is A
+        #     # solver.options["halt_on_ampl_error"] = "yes"
+        #     solver.options["bound_relax_factor"] = 0
+        #     # solver.options["nlp_scaling_method"] = "user-scaling"
+        #     solver.solve(m.fs.leach, tee=True)
+        #     print(solver.options)
+        #
+        #     from idaes.core.util.model_statistics import large_residuals_set
+        #     print("Large Residuals")
+        #     none_count = 0
+        #     for c in large_residuals_set(m.fs.leach, tol=1.0):
+        #         v = value(c.body, exception=False)
+        #         if v is None:
+        #             none_count += 1
+        #         else:
+        #             print(c.name, "=", v)
+        #     print("skipped (still uninitialized):", none_count)
+        #
+        #     m.fs.leach.liquid_inlet.flow_vol.unfix()
+        #     m.fs.leach.liquid_inlet.conc_mass_comp.unfix()
+        #     m.fs.leach.liquid_inlet.temperature.unfix()
+        #     m.fs.leach.liquid_inlet.pressure.unfix()
+        #
+        #     m.fs.leach.solid_inlet.flow_mass.unfix()
+        #     m.fs.leach.solid_inlet.mass_frac_comp.unfix()
         #
         # elif unit == m.fs.solex_cleaner_load:
         #     _log.info(f"Manually initializing {unit}")
@@ -1528,6 +1540,7 @@ def solve_system(m, solver_obj=None, tee=False):
     # solver_obj.options.constr_viol_tol = 1e-8
     solver_obj.options.constr_viol_tol = 1e-6
     solver_obj.options["nlp_scaling_method"] = "user-scaling"
+    solver_obj.options["bound_relax_factor"] = 0
     # solver_obj.options["halt_on_ampl_error"] = "yes"
     solver_obj.options["max_iter"] = 300
 
